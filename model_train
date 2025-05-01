@@ -1,0 +1,243 @@
+from torch.utils.data import Dataset, DataLoader
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from transformers import BertTokenizer, BertForSequenceClassification, get_linear_schedule_with_warmup
+import numpy as np
+from tqdm import tqdm  # 导入tqdm库
+from sklearn.metrics import precision_recall_fscore_support, roc_curve, auc, confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+class SentimentDataset(Dataset):
+    def __init__(self, filepath, max_len, tokenizer):
+        self.filepath = filepath
+        self.max_len = max_len
+        self.tokenizer = tokenizer
+        self.data = self._load_data()
+
+    def _load_data(self):
+        data = []
+        with open(self.filepath, 'r', encoding='utf-8') as file:
+            for line in file:
+                sentence, label = line.strip().split('\t')
+                data.append((sentence, int(label)))
+        return data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        sentence, label = self.data[idx]
+        encoding = self.tokenizer.encode_plus(
+            sentence,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            return_token_type_ids=False,
+            padding='max_length',
+            truncation=True,  # 确保句子被截断到最大长度
+            return_attention_mask=True,
+            return_tensors='pt',
+        )
+        return {
+            'sentence': sentence,
+            'input_ids': encoding['input_ids'].squeeze(),  # 移除多余的维度
+            'attention_mask': encoding['attention_mask'].squeeze(),  # 同上
+            'label': torch.tensor(label, dtype=torch.long)
+        }
+
+def create_data_loader(filepath, tokenizer, max_len, batch_size):
+    ds = SentimentDataset(
+        filepath=filepath,
+        max_len=max_len,
+        tokenizer=tokenizer
+    )
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        num_workers=4
+    )
+
+# 参数设置
+MAX_LEN = 128
+BATCH_SIZE = 16
+
+# 加载BERT分词器
+tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
+
+# 创建训练数据加载器
+train_loader = create_data_loader('C:/Users/zhy03/Desktop/毕业设计/毕设提交材料/训练材料/chnsenticorp/train/part.0', tokenizer, MAX_LEN, BATCH_SIZE)
+
+# 创建验证数据加载器（假设你有一个验证集）
+val_loader = create_data_loader('C:/Users/zhy03/Desktop/毕业设计/毕设提交材料/训练材料/chnsenticorp/dev/part.0', tokenizer, MAX_LEN, BATCH_SIZE)
+
+# 加载预训练的BERT模型
+model = BertForSequenceClassification.from_pretrained('bert-base-chinese', num_labels=2)
+device = torch.device("cpu")  # 如果没有CUDA支持，改为使用CPU
+model = model.to(device)
+
+# 损失函数和优化器
+criterion = nn.CrossEntropyLoss().to(device)
+optimizer = AdamW(model.parameters(), lr=2e-5)
+
+# 训练步骤
+def train_epoch(model, data_loader, optimizer, criterion, device, scheduler, n_examples):
+    model = model.train()
+    losses = []
+    correct_predictions = 0
+    all_preds = []
+    all_labels = []
+    all_probs = []
+
+    for d in tqdm(data_loader, desc="Training"):  # 使用tqdm显示进度条
+        input_ids = d["input_ids"].to(device)
+        attention_mask = d["attention_mask"].to(device)
+        labels = d["label"].to(device)
+
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+
+        probs = torch.softmax(outputs.logits, dim=1)[:, 1]  # 获取正类的概率
+        _, preds = torch.max(outputs.logits, dim=1)
+        loss = criterion(outputs.logits, labels)
+
+        correct_predictions += torch.sum(preds == labels)
+        losses.append(loss.item())
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        all_probs.extend(probs.detach().cpu().numpy())  # 使用detach()分离梯度计算
+
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='binary')
+    fpr, tpr, _ = roc_curve(all_labels, all_probs)
+    roc_auc = auc(fpr, tpr)
+
+    # 绘制ROC曲线
+    plt.figure()
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label='ROC curve (area = %0.2f)' % roc_auc)
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic')
+    plt.legend(loc="lower right")
+    plt.show()
+
+    # 计算混淆矩阵
+    cm = confusion_matrix(all_labels, all_preds)
+
+    # 绘制混淆矩阵
+    plt.figure(figsize=(10, 7))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.title('Confusion Matrix')
+    plt.show()
+
+    return correct_predictions.double() / n_examples, np.mean(losses), precision, recall, f1, roc_auc
+
+# 评估步骤
+def eval_model(model, data_loader, criterion, device, n_examples):
+    model = model.eval()
+    losses = []
+    correct_predictions = 0
+    all_preds = []
+    all_labels = []
+    all_probs = []
+
+    with torch.no_grad():
+        for d in tqdm(data_loader, desc="Validation"):  # 使用tqdm显示进度条
+            input_ids = d["input_ids"].to(device)
+            attention_mask = d["attention_mask"].to(device)
+            labels = d["label"].to(device)
+
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+
+            probs = torch.softmax(outputs.logits, dim=1)[:, 1]  # 获取正类的概率
+            _, preds = torch.max(outputs.logits, dim=1)
+            loss = criterion(outputs.logits, labels)
+
+            correct_predictions += torch.sum(preds == labels)
+            losses.append(loss.item())
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+
+    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='binary')
+    fpr, tpr, _ = roc_curve(all_labels, all_probs)
+    roc_auc = auc(fpr, tpr)
+
+    # 绘制ROC曲线
+    plt.figure()
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label='ROC curve (area = %0.2f)' % roc_auc)
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic')
+    plt.legend(loc="lower right")
+    plt.show()
+
+    # 计算混淆矩阵
+    cm = confusion_matrix(all_labels, all_preds)
+
+    # 绘制混淆矩阵
+    plt.figure(figsize=(10, 7))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.title('Confusion Matrix')
+    plt.show()
+
+    return correct_predictions.double() / n_examples, np.mean(losses), precision, recall, f1, roc_auc
+
+# 训练模型
+EPOCHS = 3
+total_steps = len(train_loader) * EPOCHS
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
+
+if __name__ == '__main__':
+    for epoch in range(EPOCHS):
+        print(f'Epoch {epoch + 1}/{EPOCHS}')
+        print('-' * 10)
+
+        train_acc, train_loss, train_precision, train_recall, train_f1, train_auc = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            scheduler,
+            len(train_loader.dataset)
+        )
+
+        print(f'Train loss {train_loss} accuracy {train_acc} precision {train_precision} recall {train_recall} f1 {train_f1} auc {train_auc}')
+
+        val_acc, val_loss, val_precision, val_recall, val_f1, val_auc = eval_model(
+            model,
+            val_loader,
+            criterion,
+            device,
+            len(val_loader.dataset)
+        )
+
+        print(f'Val   loss {val_loss} accuracy {val_acc} precision {val_precision} recall {val_recall} f1 {val_f1} auc {val_auc}')
+        print()
+
+    # 保存模型
+    torch.save(model.state_dict(), 'sentiment_model.pt')
+    # 假设你已经训练好了模型
+    model.save_pretrained('C:/Users/zhy03/Desktop/毕业设计/毕设提交材料/训练材料/chnsenticorp/model')
+    tokenizer.save_pretrained('C:/Users/zhy03/Desktop/毕业设计/毕设提交材料/训练材料/chnsenticorp/model/')
